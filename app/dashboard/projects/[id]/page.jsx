@@ -1,0 +1,595 @@
+'use client';
+
+import * as XLSX from 'xlsx';
+import { useState, useEffect } from 'react';
+import { useParams, useRouter } from 'next/navigation';
+import Link from 'next/link';
+import { createClient } from '@/lib/supabase/client';
+
+const FILE_CATEGORY_LABELS = {
+  pumseum: '품셈',
+  ilwidaega: '일위대가',
+  noim: '노임단가',
+  jajae: '자재단가',
+  pyojun: '표준시장단가',
+};
+
+const FILE_CATEGORY_EMOJIS = {
+  pumseum: '1️⃣',
+  ilwidaega: '2️⃣',
+  noim: '3️⃣',
+  jajae: '4️⃣',
+  pyojun: '5️⃣',
+};
+
+const STATUS_BADGES = {
+  pending: { label: '대기', className: 'bg-gray-100 text-gray-700' },
+  analyzing: { label: '분석 중', className: 'bg-blue-100 text-blue-700' },
+  completed: { label: '완료', className: 'bg-green-100 text-green-700' },
+  failed: { label: '실패', className: 'bg-red-100 text-red-700' },
+};
+
+const SEVERITY_STYLES = {
+  critical: {
+    label: '🔴 심각',
+    bgColor: 'bg-red-50',
+    borderColor: 'border-red-200',
+    titleColor: 'text-red-900',
+    badgeColor: 'bg-red-100 text-red-700',
+  },
+  warning: {
+    label: '🟡 경고',
+    bgColor: 'bg-yellow-50',
+    borderColor: 'border-yellow-200',
+    titleColor: 'text-yellow-900',
+    badgeColor: 'bg-yellow-100 text-yellow-700',
+  },
+  info: {
+    label: '🔵 정보',
+    bgColor: 'bg-blue-50',
+    borderColor: 'border-blue-200',
+    titleColor: 'text-blue-900',
+    badgeColor: 'bg-blue-100 text-blue-700',
+  },
+};
+
+function formatFileSize(bytes) {
+  if (!bytes) return '0 B';
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function formatDate(dateString) {
+  if (!dateString) return '-';
+  const date = new Date(dateString);
+  return date.toLocaleString('ko-KR', {
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit',
+  });
+}
+
+// Excel 파싱 함수
+async function parseExcelFile(fileData) {
+  const arrayBuffer = fileData instanceof Blob ? await fileData.arrayBuffer() : fileData;
+  const workbook = XLSX.read(arrayBuffer, { type: 'array', cellDates: true });
+  const sheets = [];
+  let totalRows = 0;
+  let totalCells = 0;
+
+  workbook.SheetNames.forEach((sheetName) => {
+    const worksheet = workbook.Sheets[sheetName];
+    const rows = XLSX.utils.sheet_to_json(worksheet, {
+      header: 1, defval: '', blankrows: false, raw: false,
+    });
+    if (rows.length === 0) return;
+    const cellCount = rows.reduce((sum, row) => sum + row.length, 0);
+    sheets.push({
+      name: sheetName, rows: rows,
+      rowCount: rows.length,
+      colCount: Math.max(...rows.map(r => r.length), 0),
+    });
+    totalRows += rows.length;
+    totalCells += cellCount;
+  });
+
+  const summary = `${sheets.length}개 시트, 총 ${totalRows.toLocaleString()}행, ${totalCells.toLocaleString()}셀`;
+  return { sheets, summary, totalRows, totalCells, sheetCount: sheets.length };
+}
+
+async function fetchAndParseExcel(supabase, storagePath) {
+  const { data, error } = await supabase.storage.from('project-files').download(storagePath);
+  if (error) throw new Error(`파일 다운로드 실패: ${error.message}`);
+  if (!data) throw new Error('파일 데이터가 비어있습니다.');
+  return await parseExcelFile(data);
+}
+
+export default function ProjectDetailPage() {
+  const params = useParams();
+  const router = useRouter();
+  const supabase = createClient();
+  const projectId = params.id;
+
+  const [project, setProject] = useState(null);
+  const [documents, setDocuments] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  // 텍스트 추출 상태
+  const [extracting, setExtracting] = useState(false);
+  const [extractProgress, setExtractProgress] = useState({ step: '', current: 0, total: 0 });
+  const [extractResults, setExtractResults] = useState(null);
+  const [extractError, setExtractError] = useState(null);
+
+  // AI 검토 상태
+  const [reviewing, setReviewing] = useState(false);
+  const [reviewProgress, setReviewProgress] = useState('');
+  const [reviewResult, setReviewResult] = useState(null);
+  const [reviewError, setReviewError] = useState(null);
+
+  useEffect(() => {
+    async function fetchProjectData() {
+      try {
+        const { data: projectData, error: projectError } = await supabase
+          .from('projects').select('*').eq('id', projectId).single();
+        if (projectError) throw new Error(`프로젝트 조회 실패: ${projectError.message}`);
+        if (!projectData) throw new Error('프로젝트를 찾을 수 없습니다.');
+        setProject(projectData);
+
+        const { data: docsData, error: docsError } = await supabase
+          .from('documents').select('*').eq('project_id', projectId).order('created_at', { ascending: true });
+        if (docsError) throw new Error(`문서 조회 실패: ${docsError.message}`);
+        setDocuments(docsData || []);
+      } catch (err) {
+        console.error('데이터 로딩 에러:', err);
+        setError(err.message);
+      } finally {
+        setLoading(false);
+      }
+    }
+    fetchProjectData();
+  }, [projectId]);
+
+  // Excel 추출 (기존 기능)
+  const handleExtractText = async () => {
+    setExtracting(true);
+    setExtractError(null);
+    setExtractResults(null);
+
+    try {
+      const excelDocs = documents.filter(doc => {
+        const name = (doc.filename || '').toLowerCase();
+        return name.endsWith('.xlsx') || name.endsWith('.xls');
+      });
+
+      if (excelDocs.length === 0) throw new Error('Excel 파일이 없습니다.');
+
+      const totalFiles = excelDocs.length;
+      const results = [];
+
+      for (let i = 0; i < totalFiles; i++) {
+        const doc = excelDocs[i];
+        const label = FILE_CATEGORY_LABELS[doc.category] || doc.category;
+        setExtractProgress({ step: `파싱 중: ${label}`, current: i + 1, total: totalFiles });
+
+        try {
+          const parseResult = await fetchAndParseExcel(supabase, doc.storage_path);
+          results.push({
+            documentId: doc.id, category: doc.category, label, filename: doc.filename,
+            fileSize: doc.file_size, success: true, ...parseResult,
+          });
+        } catch (err) {
+          results.push({
+            documentId: doc.id, category: doc.category, label, filename: doc.filename,
+            success: false, error: err.message,
+          });
+        }
+      }
+
+      setExtractProgress({ step: '완료!', current: totalFiles, total: totalFiles });
+      setExtractResults(results);
+      setTimeout(() => setExtractProgress({ step: '', current: 0, total: 0 }), 500);
+    } catch (err) {
+      console.error('추출 에러:', err);
+      setExtractError(err.message);
+    } finally {
+      setExtracting(false);
+    }
+  };
+
+  // 🔥 AI 검토 (새 기능!)
+  const handleAiReview = async () => {
+    setReviewing(true);
+    setReviewError(null);
+    setReviewResult(null);
+
+    try {
+      // 1. Excel 파일들 추출
+      setReviewProgress('📄 Excel 파일 분석 준비 중...');
+      const excelDocs = documents.filter(doc => {
+        const name = (doc.filename || '').toLowerCase();
+        return name.endsWith('.xlsx') || name.endsWith('.xls');
+      });
+
+      if (excelDocs.length === 0) throw new Error('Excel 파일이 없습니다. (PDF는 보관용)');
+
+      const excelData = [];
+      for (let i = 0; i < excelDocs.length; i++) {
+        const doc = excelDocs[i];
+        const label = FILE_CATEGORY_LABELS[doc.category] || doc.category;
+        setReviewProgress(`📄 추출 중: ${label} (${i + 1}/${excelDocs.length})`);
+
+        const parseResult = await fetchAndParseExcel(supabase, doc.storage_path);
+        excelData.push({
+          category: doc.category,
+          label,
+          filename: doc.filename,
+          summary: parseResult.summary,
+          sheets: parseResult.sheets,
+        });
+      }
+
+      // 2. AI 검토 API 호출
+      setReviewProgress('🤖 Claude AI가 검토 중... (최대 30초 소요)');
+
+      const response = await fetch('/api/review', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          projectId,
+          projectName: project.name,
+          excelData,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || 'AI 검토 실패');
+      }
+
+      // 3. 결과 표시
+      setReviewProgress('✅ 검토 완료!');
+      setReviewResult(data);
+
+      setTimeout(() => setReviewProgress(''), 1000);
+    } catch (err) {
+      console.error('AI 검토 에러:', err);
+      setReviewError(err.message);
+    } finally {
+      setReviewing(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-gray-50 py-12 px-4">
+        <div className="max-w-3xl mx-auto">
+          <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-12 text-center">
+            <div className="inline-block w-8 h-8 border-4 border-blue-600 border-t-transparent rounded-full animate-spin mb-4"></div>
+            <p className="text-gray-600">프로젝트 정보를 불러오는 중...</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="min-h-screen bg-gray-50 py-12 px-4">
+        <div className="max-w-3xl mx-auto">
+          <Link href="/dashboard" className="inline-flex items-center text-gray-600 hover:text-gray-900 mb-6 text-sm">← 대시보드로 돌아가기</Link>
+          <div className="bg-red-50 border border-red-200 rounded-lg p-6">
+            <h2 className="text-lg font-semibold text-red-900 mb-2">⚠️ 오류</h2>
+            <p className="text-red-700">{error}</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const status = STATUS_BADGES[project.status] || STATUS_BADGES.pending;
+  const excelDocsCount = documents.filter(doc => {
+    const name = (doc.filename || '').toLowerCase();
+    return name.endsWith('.xlsx') || name.endsWith('.xls');
+  }).length;
+
+  return (
+    <div className="min-h-screen bg-gray-50 py-8 px-4">
+      <div className="max-w-3xl mx-auto">
+        <Link href="/dashboard" className="inline-flex items-center text-gray-600 hover:text-gray-900 mb-4 text-sm">← 대시보드로 돌아가기</Link>
+
+        {/* 헤더 */}
+        <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6 mb-4">
+          <div className="flex items-start justify-between mb-3">
+            <h1 className="text-2xl font-bold text-gray-900 flex-1">🏗️ {project.name}</h1>
+            <span className={`ml-3 px-3 py-1 text-xs font-semibold rounded-full ${status.className}`}>{status.label}</span>
+          </div>
+          <div className="text-sm text-gray-500 space-x-4">
+            <span>📅 생성: {formatDate(project.created_at)}</span>
+          </div>
+        </div>
+
+        {/* 파일 목록 */}
+        <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-5 mb-4">
+          <h2 className="text-base font-semibold text-gray-900 mb-4">
+            📎 업로드된 파일 <span className="text-sm font-normal text-gray-500">({documents.length}개)</span>
+          </h2>
+          {documents.length === 0 ? (
+            <p className="text-sm text-gray-500 text-center py-4">업로드된 파일이 없습니다.</p>
+          ) : (
+            <div className="space-y-2">
+              {documents.map((doc) => {
+                const isExcel = ['xlsx', 'xls'].some(ext => (doc.filename || '').toLowerCase().endsWith(ext));
+                const isPdf = (doc.filename || '').toLowerCase().endsWith('pdf');
+                return (
+                  <div key={doc.id} className="flex items-center gap-3 px-3 py-2 bg-blue-50 border border-blue-200 rounded-lg">
+                    <span className="text-base flex-shrink-0">{FILE_CATEGORY_EMOJIS[doc.category] || '📄'}</span>
+                    <span className="text-sm font-medium text-gray-900 w-24 flex-shrink-0">{FILE_CATEGORY_LABELS[doc.category] || doc.category}</span>
+                    <span className="text-sm flex-shrink-0">{isPdf ? '📕' : isExcel ? '📗' : '📄'}</span>
+                    <span className="text-sm text-gray-700 truncate flex-1 min-w-0">{doc.filename}</span>
+                    <span className="text-xs text-gray-500 flex-shrink-0">{formatFileSize(doc.file_size)}</span>
+                    {isPdf && <span className="text-xs px-2 py-0.5 bg-gray-200 text-gray-600 rounded flex-shrink-0">보관용</span>}
+                    {isExcel && <span className="text-xs px-2 py-0.5 bg-green-100 text-green-700 rounded flex-shrink-0">분석 대상</span>}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {/* 액션 버튼 */}
+        <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-5 mb-4">
+          <h2 className="text-base font-semibold text-gray-900 mb-3">🎯 다음 단계</h2>
+          <div className="space-y-2">
+            <button onClick={handleExtractText} disabled={extracting || reviewing || excelDocsCount === 0}
+              className="w-full px-4 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition text-sm font-medium text-left">
+              {extracting ? '⏳ 추출 중...' : '📊 Excel 텍스트 추출 미리보기'}
+              <span className="block text-xs font-normal text-blue-100 mt-0.5">Excel 파일 {excelDocsCount}개를 분석 가능한 텍스트로 변환</span>
+            </button>
+
+            <button onClick={handleAiReview} disabled={reviewing || extracting || excelDocsCount === 0}
+              className="w-full px-4 py-3 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed transition text-sm font-medium text-left">
+              {reviewing ? '🤖 AI 검토 진행 중...' : '🤖 AI 검토 시작 (Claude)'}
+              <span className="block text-xs font-normal text-purple-100 mt-0.5">Claude AI가 단가 검증 및 이슈 발견 (소요시간 ~30초)</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Excel 추출 진행 */}
+        {extracting && extractProgress.step && (
+          <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-4">
+            <div className="flex items-center gap-3 mb-2">
+              <div className="w-5 h-5 border-2 border-blue-600 border-t-transparent rounded-full animate-spin"></div>
+              <p className="text-sm font-medium text-blue-900">{extractProgress.step}</p>
+            </div>
+            {extractProgress.total > 0 && (
+              <div className="ml-8">
+                <div className="flex justify-between text-xs text-blue-700 mb-1">
+                  <span>진행률</span>
+                  <span>{extractProgress.current} / {extractProgress.total}</span>
+                </div>
+                <div className="w-full bg-blue-200 rounded-full h-2">
+                  <div className="bg-blue-600 h-2 rounded-full transition-all duration-300" style={{ width: `${(extractProgress.current / extractProgress.total) * 100}%` }}></div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {extractError && (
+          <div className="bg-red-50 border border-red-200 rounded-lg p-4 mb-4">
+            <p className="text-sm text-red-700">⚠️ {extractError}</p>
+          </div>
+        )}
+
+        {/* Excel 추출 결과 */}
+        {extractResults && (
+          <div className="space-y-4 mb-4">
+            <div className="bg-green-50 border border-green-200 rounded-lg p-4">
+              <h2 className="text-base font-semibold text-green-900 mb-2">✅ 추출 완료!</h2>
+              <p className="text-sm text-green-700">{extractResults.filter(r => r.success).length} / {extractResults.length}개 파일 추출 성공</p>
+            </div>
+            {extractResults.map((result) => (
+              <ExtractResultCard key={result.documentId} result={result} />
+            ))}
+          </div>
+        )}
+
+        {/* 🔥 AI 검토 진행 */}
+        {reviewing && reviewProgress && (
+          <div className="bg-purple-50 border border-purple-200 rounded-lg p-4 mb-4">
+            <div className="flex items-center gap-3">
+              <div className="w-5 h-5 border-2 border-purple-600 border-t-transparent rounded-full animate-spin"></div>
+              <p className="text-sm font-medium text-purple-900">{reviewProgress}</p>
+            </div>
+          </div>
+        )}
+
+        {reviewError && (
+          <div className="bg-red-50 border border-red-200 rounded-lg p-4 mb-4">
+            <p className="text-sm text-red-700">⚠️ AI 검토 실패: {reviewError}</p>
+          </div>
+        )}
+
+        {/* 🔥 AI 검토 결과 */}
+        {reviewResult && reviewResult.result && (
+          <ReviewResultPanel data={reviewResult} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Excel 추출 결과 카드
+function ExtractResultCard({ result }) {
+  const [expanded, setExpanded] = useState(false);
+
+  if (!result.success) {
+    return (
+      <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+        <h3 className="text-sm font-semibold text-red-900 mb-1">❌ {result.label} - 추출 실패</h3>
+        <p className="text-xs text-red-600">{result.filename}</p>
+        <p className="text-xs text-red-700 mt-2">{result.error}</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-white border border-gray-200 rounded-lg overflow-hidden">
+      <div className="px-4 py-3 bg-gray-50 border-b border-gray-200 cursor-pointer hover:bg-gray-100 transition" onClick={() => setExpanded(!expanded)}>
+        <div className="flex items-center justify-between">
+          <div className="flex-1 min-w-0">
+            <h3 className="text-sm font-semibold text-gray-900">📗 {result.label}<span className="ml-2 text-xs font-normal text-gray-500">{result.filename}</span></h3>
+            <p className="text-xs text-gray-600 mt-0.5">{result.summary}</p>
+          </div>
+          <span className="text-xs text-gray-500 flex-shrink-0 ml-3">{expanded ? '▼ 접기' : '▶ 펼치기'}</span>
+        </div>
+      </div>
+
+      {expanded && (
+        <div className="p-4 space-y-4">
+          {result.sheets.map((sheet, sheetIdx) => (
+            <div key={sheetIdx}>
+              <h4 className="text-sm font-semibold text-gray-900 mb-2">
+                📄 시트 {sheetIdx + 1}: {sheet.name}<span className="ml-2 text-xs font-normal text-gray-500">({sheet.rowCount}행 × {sheet.colCount}열)</span>
+              </h4>
+              {sheet.rows.length === 0 ? (
+                <p className="text-xs text-gray-500 italic">(빈 시트)</p>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="min-w-full text-xs border border-gray-200">
+                    <tbody>
+                      {sheet.rows.slice(0, 10).map((row, rowIdx) => (
+                        <tr key={rowIdx} className={rowIdx === 0 ? 'bg-blue-50 font-semibold' : 'hover:bg-gray-50'}>
+                          {row.slice(0, 8).map((cell, cellIdx) => (
+                            <td key={cellIdx} className="border border-gray-200 px-2 py-1 truncate max-w-[150px]">{String(cell || '')}</td>
+                          ))}
+                          {row.length > 8 && (<td className="border border-gray-200 px-2 py-1 text-gray-400 italic">... +{row.length - 8}열</td>)}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {sheet.rows.length > 10 && (<p className="text-xs text-gray-500 mt-1 italic">... 외 {sheet.rows.length - 10}행 더 있음</p>)}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// 🔥 AI 검토 결과 패널
+function ReviewResultPanel({ data }) {
+  const { result, usage } = data;
+  const { summary, totalIssues, severity, issues, recommendations } = result;
+
+  return (
+    <div className="space-y-4">
+      {/* 요약 */}
+      <div className="bg-purple-50 border border-purple-200 rounded-lg p-5">
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-lg font-semibold text-purple-900">🤖 Claude AI 검토 완료</h2>
+          {usage && (
+            <span className="text-xs text-purple-600">
+              ⏱ {usage.elapsedSeconds}초 · {(usage.inputTokens + usage.outputTokens).toLocaleString()} 토큰
+            </span>
+          )}
+        </div>
+        <p className="text-sm text-purple-800 mb-4 leading-relaxed">{summary}</p>
+
+        <div className="grid grid-cols-3 gap-2">
+          <div className="bg-red-100 rounded p-2 text-center">
+            <p className="text-xs text-red-700">🔴 심각</p>
+            <p className="text-2xl font-bold text-red-700">{severity?.critical || 0}</p>
+          </div>
+          <div className="bg-yellow-100 rounded p-2 text-center">
+            <p className="text-xs text-yellow-700">🟡 경고</p>
+            <p className="text-2xl font-bold text-yellow-700">{severity?.warning || 0}</p>
+          </div>
+          <div className="bg-blue-100 rounded p-2 text-center">
+            <p className="text-xs text-blue-700">🔵 정보</p>
+            <p className="text-2xl font-bold text-blue-700">{severity?.info || 0}</p>
+          </div>
+        </div>
+      </div>
+
+      {/* 이슈 목록 */}
+      {issues && issues.length > 0 && (
+        <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-5">
+          <h2 className="text-base font-semibold text-gray-900 mb-4">
+            🔍 발견된 이슈 <span className="text-sm font-normal text-gray-500">({totalIssues}개)</span>
+          </h2>
+          <div className="space-y-3">
+            {issues.map((issue) => (
+              <IssueCard key={issue.id} issue={issue} />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* 권장사항 */}
+      {recommendations && recommendations.length > 0 && (
+        <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-5">
+          <h2 className="text-base font-semibold text-gray-900 mb-3">💡 종합 권장사항</h2>
+          <ul className="space-y-2">
+            {recommendations.map((rec, idx) => (
+              <li key={idx} className="flex items-start gap-2 text-sm text-gray-700">
+                <span className="text-purple-600 flex-shrink-0">•</span>
+                <span>{rec}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// 이슈 카드 (펼치기 가능)
+function IssueCard({ issue }) {
+  const [expanded, setExpanded] = useState(false);
+  const style = SEVERITY_STYLES[issue.severity] || SEVERITY_STYLES.info;
+
+  return (
+    <div className={`border ${style.borderColor} ${style.bgColor} rounded-lg overflow-hidden`}>
+      <div className="px-4 py-3 cursor-pointer hover:bg-opacity-70 transition" onClick={() => setExpanded(!expanded)}>
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2 flex-1 min-w-0">
+            <span className={`px-2 py-0.5 text-xs font-medium rounded ${style.badgeColor} flex-shrink-0`}>
+              {style.label}
+            </span>
+            <span className="text-xs text-gray-500 flex-shrink-0">[{issue.category}]</span>
+            <h3 className={`text-sm font-medium ${style.titleColor} truncate`}>
+              {issue.title}
+            </h3>
+          </div>
+          <span className="text-xs text-gray-500 flex-shrink-0">{expanded ? '▼' : '▶'}</span>
+        </div>
+      </div>
+
+      {expanded && (
+        <div className="px-4 pb-4 pt-1 space-y-3 text-sm">
+          <div>
+            <p className="text-xs font-semibold text-gray-700 mb-1">📋 설명</p>
+            <p className="text-gray-700 leading-relaxed">{issue.description}</p>
+          </div>
+          {issue.evidence && (
+            <div>
+              <p className="text-xs font-semibold text-gray-700 mb-1">🔍 근거</p>
+              <p className="text-gray-700 leading-relaxed bg-white p-2 rounded border border-gray-200">{issue.evidence}</p>
+            </div>
+          )}
+          {issue.recommendation && (
+            <div>
+              <p className="text-xs font-semibold text-gray-700 mb-1">💡 권장 조치</p>
+              <p className="text-gray-700 leading-relaxed">{issue.recommendation}</p>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
