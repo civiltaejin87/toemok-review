@@ -6,7 +6,7 @@ import LogoutButton from './logout-button';
 const STATUS_BADGES = {
   pending: { label: '대기', className: 'bg-gray-100 text-gray-700' },
   analyzing: { label: '분석 중', className: 'bg-blue-100 text-blue-700' },
-  completed: { label: '완료', className: 'bg-green-100 text-green-700' },
+  completed: { label: '검토 완료', className: 'bg-green-100 text-green-700' },
   failed: { label: '실패', className: 'bg-red-100 text-red-700' },
 };
 
@@ -26,9 +26,7 @@ export default async function DashboardPage() {
   const supabase = await createClient();
 
   const { data: { user }, error: authError } = await supabase.auth.getUser();
-  if (authError || !user) {
-    redirect('/login');
-  }
+  if (authError || !user) redirect('/login');
 
   const { data: profile } = await supabase
     .from('profiles')
@@ -52,8 +50,18 @@ export default async function DashboardPage() {
     .select('id', { count: 'exact', head: true })
     .eq('user_id', user.id);
 
-  const totalIssues = 0;
+  // 🔥 진짜 이슈 수 계산!
+  const { data: reviewsData } = await supabase
+    .from('reviews')
+    .select('total_issues, severity_critical, severity_warning, severity_info')
+    .eq('user_id', user.id);
 
+  const reviewsList = reviewsData || [];
+  const totalIssues = reviewsList.reduce((sum, r) => sum + (r.total_issues || 0), 0);
+  const totalCritical = reviewsList.reduce((sum, r) => sum + (r.severity_critical || 0), 0);
+  const totalWarning = reviewsList.reduce((sum, r) => sum + (r.severity_warning || 0), 0);
+
+  // 각 프로젝트의 파일 수 + 검토 상태 가져오기
   const projectsWithCount = await Promise.all(
     projectsList.map(async (project) => {
       const { count } = await supabase
@@ -61,7 +69,20 @@ export default async function DashboardPage() {
         .select('id', { count: 'exact', head: true })
         .eq('project_id', project.id);
 
-      return { ...project, fileCount: count || 0 };
+      // 최신 검토 결과
+      const { data: latestReview } = await supabase
+        .from('reviews')
+        .select('id, total_issues, severity_critical, severity_warning, created_at')
+        .eq('project_id', project.id)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .single();
+
+      return {
+        ...project,
+        fileCount: count || 0,
+        latestReview,
+      };
     })
   );
 
@@ -78,7 +99,6 @@ export default async function DashboardPage() {
       </nav>
 
       <div className="max-w-6xl mx-auto px-4 py-8">
-
         <div className="mb-6">
           <h2 className="text-3xl font-bold text-gray-900 mb-1">
             안녕하세요, {displayName}님 👋
@@ -90,13 +110,16 @@ export default async function DashboardPage() {
           )}
         </div>
 
+        {/* 통계 카드 (3개) */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
           <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-5">
             <div className="flex items-center justify-between mb-2">
               <h3 className="text-sm text-gray-600">검토 프로젝트</h3>
               <span className="text-xl">📊</span>
             </div>
-            <p className="text-3xl font-bold text-blue-600">{totalProjects}<span className="text-base font-normal text-gray-500 ml-1">개</span></p>
+            <p className="text-3xl font-bold text-blue-600">
+              {totalProjects}<span className="text-base font-normal text-gray-500 ml-1">개</span>
+            </p>
           </div>
 
           <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-5">
@@ -104,18 +127,37 @@ export default async function DashboardPage() {
               <h3 className="text-sm text-gray-600">업로드 문서</h3>
               <span className="text-xl">📄</span>
             </div>
-            <p className="text-3xl font-bold text-green-600">{totalDocuments || 0}<span className="text-base font-normal text-gray-500 ml-1">개</span></p>
+            <p className="text-3xl font-bold text-green-600">
+              {totalDocuments || 0}<span className="text-base font-normal text-gray-500 ml-1">개</span>
+            </p>
           </div>
 
-          <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-5">
+          <div className={`rounded-lg shadow-sm border p-5 ${
+            totalCritical > 0 ? 'bg-red-50 border-red-200' :
+            totalWarning > 0 ? 'bg-yellow-50 border-yellow-200' :
+            'bg-white border-gray-200'
+          }`}>
             <div className="flex items-center justify-between mb-2">
               <h3 className="text-sm text-gray-600">발견된 이슈</h3>
               <span className="text-xl">⚠️</span>
             </div>
-            <p className="text-3xl font-bold text-red-600">{totalIssues}<span className="text-base font-normal text-gray-500 ml-1">개</span></p>
+            <p className={`text-3xl font-bold ${
+              totalCritical > 0 ? 'text-red-600' :
+              totalWarning > 0 ? 'text-yellow-600' :
+              'text-gray-400'
+            }`}>
+              {totalIssues}<span className="text-base font-normal text-gray-500 ml-1">개</span>
+            </p>
+            {totalIssues > 0 && (
+              <div className="flex gap-2 mt-2 text-xs">
+                {totalCritical > 0 && <span className="text-red-700">🔴 심각 {totalCritical}</span>}
+                {totalWarning > 0 && <span className="text-yellow-700">🟡 경고 {totalWarning}</span>}
+              </div>
+            )}
           </div>
         </div>
 
+        {/* 프로젝트 목록 */}
         <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-5">
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-lg font-semibold text-gray-900">
@@ -148,6 +190,7 @@ export default async function DashboardPage() {
             <div className="space-y-2">
               {projectsWithCount.map((project) => {
                 const status = STATUS_BADGES[project.status] || STATUS_BADGES.pending;
+                const review = project.latestReview;
 
                 return (
                   <Link
@@ -165,9 +208,16 @@ export default async function DashboardPage() {
                             {status.label}
                           </span>
                         </div>
-                        <div className="flex items-center gap-3 text-xs text-gray-500">
+                        <div className="flex items-center gap-3 text-xs text-gray-500 flex-wrap">
                           <span>📅 {formatDate(project.created_at)}</span>
                           <span>📎 파일 {project.fileCount}개</span>
+                          {review && (
+                            <span className="text-purple-600 font-medium">
+                              🤖 이슈 {review.total_issues}개
+                              {review.severity_critical > 0 && ` (🔴 ${review.severity_critical})`}
+                              {review.severity_warning > 0 && ` (🟡 ${review.severity_warning})`}
+                            </span>
+                          )}
                         </div>
                       </div>
                       <span className="text-gray-400 flex-shrink-0">→</span>
@@ -179,13 +229,12 @@ export default async function DashboardPage() {
           )}
         </div>
 
-        <div className="mt-6 bg-blue-50 border border-blue-200 rounded-lg p-4">
-          <h3 className="font-semibold text-blue-900 mb-1">🚧 베타 버전 진행 중</h3>
-          <p className="text-sm text-blue-700">
-            현재 파일 업로드 및 텍스트 추출 기능이 동작합니다. AI 검토 기능(Phase 4-3)이 곧 추가됩니다.
+        <div className="mt-6 bg-purple-50 border border-purple-200 rounded-lg p-4">
+          <h3 className="font-semibold text-purple-900 mb-1">🤖 AI 검토 활성화</h3>
+          <p className="text-sm text-purple-700">
+            Claude AI가 토목 내역서를 분석하여 단가 적정성, 노무비, 자재비, 품셈 정합성을 검토합니다.
           </p>
         </div>
-
       </div>
     </div>
   );

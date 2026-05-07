@@ -2,39 +2,31 @@ import Anthropic from '@anthropic-ai/sdk';
 import { NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
 
-// Anthropic 클라이언트 초기화
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
 /**
  * POST /api/review
- * Body: { projectId, excelData }
- *
- * 토목 내역서 검토 요청을 받아 Claude API로 분석 후 결과 반환
+ * Body: { projectId, projectName, excelData }
+ * AI 검토 + DB 저장
  */
 export async function POST(request) {
   try {
-    // 1. 인증 확인
+    // 1. 인증
     const supabase = await createClient();
     const { data: { user }, error: authError } = await supabase.auth.getUser();
 
     if (authError || !user) {
-      return NextResponse.json(
-        { error: '로그인이 필요합니다.' },
-        { status: 401 }
-      );
+      return NextResponse.json({ error: '로그인이 필요합니다.' }, { status: 401 });
     }
 
-    // 2. 요청 데이터 파싱
+    // 2. 요청 데이터
     const body = await request.json();
     const { projectId, projectName, excelData } = body;
 
     if (!projectId || !excelData || excelData.length === 0) {
-      return NextResponse.json(
-        { error: '필수 데이터가 누락되었습니다.' },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: '필수 데이터 누락' }, { status: 400 });
     }
 
     // 3. 프로젝트 소유권 확인
@@ -46,13 +38,10 @@ export async function POST(request) {
       .single();
 
     if (projectError || !project) {
-      return NextResponse.json(
-        { error: '프로젝트에 접근할 수 없습니다.' },
-        { status: 403 }
-      );
+      return NextResponse.json({ error: '프로젝트 접근 불가' }, { status: 403 });
     }
 
-    // 4. Claude에게 보낼 프롬프트 생성
+    // 4. 프롬프트 생성
     const prompt = buildReviewPrompt(projectName || project.name, excelData);
 
     // 5. Claude API 호출
@@ -62,12 +51,7 @@ export async function POST(request) {
     const message = await anthropic.messages.create({
       model: 'claude-sonnet-4-5-20250929',
       max_tokens: 8000,
-      messages: [
-        {
-          role: 'user',
-          content: prompt,
-        },
-      ],
+      messages: [{ role: 'user', content: prompt }],
     });
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -75,72 +59,116 @@ export async function POST(request) {
 
     // 6. 응답 파싱
     const responseText = message.content[0].text;
-
-    // JSON 부분 추출 (```json ... ``` 형식 또는 그냥 JSON)
     let parsedResult;
     try {
-      // 마크다운 코드블록 제거
       const cleanText = responseText
         .replace(/```json\s*/g, '')
         .replace(/```\s*/g, '')
         .trim();
-
       parsedResult = JSON.parse(cleanText);
     } catch (parseError) {
       console.error('[AI 검토] JSON 파싱 실패:', parseError);
-      console.error('원본 응답:', responseText);
-      return NextResponse.json(
-        {
-          error: 'AI 응답을 파싱할 수 없습니다.',
-          rawResponse: responseText.substring(0, 1000),
-        },
-        { status: 500 }
-      );
+      return NextResponse.json({
+        error: 'AI 응답 파싱 실패',
+        rawResponse: responseText.substring(0, 1000),
+      }, { status: 500 });
     }
 
-    // 7. 사용량 정보
     const usage = {
       inputTokens: message.usage.input_tokens,
       outputTokens: message.usage.output_tokens,
       elapsedSeconds: parseFloat(elapsed),
     };
 
+    // 7. 🔥 DB에 저장 (NEW!)
+    console.log('[AI 검토] DB 저장 시작...');
+
+    const { data: savedReview, error: reviewError } = await supabase
+      .from('reviews')
+      .insert({
+        project_id: projectId,
+        user_id: user.id,
+        summary: parsedResult.summary || '',
+        total_issues: parsedResult.totalIssues || 0,
+        severity_critical: parsedResult.severity?.critical || 0,
+        severity_warning: parsedResult.severity?.warning || 0,
+        severity_info: parsedResult.severity?.info || 0,
+        recommendations: parsedResult.recommendations || [],
+        input_tokens: usage.inputTokens,
+        output_tokens: usage.outputTokens,
+        elapsed_seconds: usage.elapsedSeconds,
+        model_name: 'claude-sonnet-4-5-20250929',
+      })
+      .select()
+      .single();
+
+    if (reviewError) {
+      console.error('[AI 검토] reviews 저장 실패:', reviewError);
+      // DB 저장 실패해도 결과는 반환 (UX 우선)
+    } else {
+      console.log('[AI 검토] reviews 저장 성공:', savedReview.id);
+
+      // 이슈 저장
+      const issues = parsedResult.issues || [];
+      if (issues.length > 0) {
+        const issuesToInsert = issues.map((issue, idx) => ({
+          review_id: savedReview.id,
+          issue_order: idx + 1,
+          severity: issue.severity || 'info',
+          category: issue.category || '기타',
+          title: issue.title || '',
+          description: issue.description || '',
+          evidence: issue.evidence || '',
+          recommendation: issue.recommendation || '',
+        }));
+
+        const { error: issuesError } = await supabase
+          .from('review_issues')
+          .insert(issuesToInsert);
+
+        if (issuesError) {
+          console.error('[AI 검토] review_issues 저장 실패:', issuesError);
+        } else {
+          console.log(`[AI 검토] review_issues ${issues.length}개 저장 성공`);
+        }
+      }
+
+      // 프로젝트 status를 'completed'로 업데이트
+      await supabase
+        .from('projects')
+        .update({ status: 'completed', updated_at: new Date().toISOString() })
+        .eq('id', projectId);
+    }
+
     // 8. 성공 응답
     return NextResponse.json({
       success: true,
       result: parsedResult,
       usage,
+      reviewId: savedReview?.id,
     });
 
   } catch (error) {
     console.error('[AI 검토] 에러:', error);
 
-    // Anthropic API 에러
     if (error.status) {
-      return NextResponse.json(
-        {
-          error: `Claude API 에러: ${error.message}`,
-          details: error.error,
-        },
-        { status: error.status }
-      );
+      return NextResponse.json({
+        error: `Claude API 에러: ${error.message}`,
+      }, { status: error.status });
     }
 
-    return NextResponse.json(
-      { error: error.message || '서버 오류가 발생했습니다.' },
-      { status: 500 }
-    );
+    return NextResponse.json({
+      error: error.message || '서버 오류'
+    }, { status: 500 });
   }
 }
 
 /**
- * 토목 검토 프롬프트 생성
+ * 토목 검토 프롬프트
  */
 function buildReviewPrompt(projectName, excelData) {
-  // 각 카테고리별 데이터 요약 (토큰 절약)
   const dataSummary = excelData.map((file) => {
     const sheets = file.sheets.map((sheet) => {
-      // 각 시트의 첫 50행만 (너무 많으면 토큰 초과)
       const sampleRows = sheet.rows.slice(0, 50);
       return `### 시트: ${sheet.name} (${sheet.rowCount}행 × ${sheet.colCount}열)
 ${sampleRows.map(row => row.join(' | ')).join('\n')}
@@ -186,8 +214,8 @@ ${dataSummary}
       "severity": "critical" | "warning" | "info",
       "category": "단가" | "노무비" | "자재비" | "품셈" | "기타",
       "title": "이슈 제목 (한 줄)",
-      "description": "구체적인 설명 (어떤 항목이 어떤 점에서 문제인지)",
-      "evidence": "근거 데이터 (어떤 셀, 어떤 값에서 발견했는지)",
+      "description": "구체적인 설명",
+      "evidence": "근거 데이터",
       "recommendation": "권장 조치사항"
     }
   ],
@@ -199,10 +227,10 @@ ${dataSummary}
 \`\`\`
 
 # 중요 규칙
-- 반드시 위 JSON 형식 그대로 답변 (다른 텍스트 X)
+- 반드시 위 JSON 형식 그대로 답변
 - 마크다운 코드블록(\`\`\`json...\`\`\`) 사용
-- 이슈는 최대 10개 (가장 중요한 것부터)
-- 데이터에 명확히 근거한 이슈만 포함 (추측 X)
+- 이슈는 최대 10개
+- 데이터에 명확히 근거한 이슈만 포함
 - 한국어로 답변
-- 데이터가 부족하면 totalIssues: 0, issues: [] 으로 답변하고 summary에 사유 명시`;
+- 데이터 부족하면 totalIssues: 0`;
 }
