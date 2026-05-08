@@ -12,6 +12,8 @@ const FILE_CATEGORY_LABELS = {
   noim: '노임단가',
   jajae: '자재단가',
   pyojun: '표준시장단가',
+  naeyeokseo: '내역서',
+  suryangsanchul: '수량산출서',
 };
 
 const FILE_CATEGORY_EMOJIS = {
@@ -20,6 +22,8 @@ const FILE_CATEGORY_EMOJIS = {
   noim: '3️⃣',
   jajae: '4️⃣',
   pyojun: '5️⃣',
+  naeyeokseo: '📋',
+  suryangsanchul: '📊',
 };
 
 const STATUS_BADGES = {
@@ -53,6 +57,9 @@ const SEVERITY_STYLES = {
   },
 };
 
+const VALIDATION_CATEGORIES = ['naeyeokseo', 'suryangsanchul'];
+const CROSS_CATEGORIES = ['pumseum', 'ilwidaega', 'noim', 'jajae', 'pyojun'];
+
 function formatFileSize(bytes) {
   if (!bytes) return '0 B';
   if (bytes < 1024) return bytes + ' B';
@@ -69,7 +76,6 @@ function formatDate(dateString) {
   });
 }
 
-// Excel 파싱 함수
 async function parseExcelFile(fileData) {
   const arrayBuffer = fileData instanceof Blob ? await fileData.arrayBuffer() : fileData;
   const workbook = XLSX.read(arrayBuffer, { type: 'array', cellDates: true });
@@ -85,7 +91,7 @@ async function parseExcelFile(fileData) {
     if (rows.length === 0) return;
     const cellCount = rows.reduce((sum, row) => sum + row.length, 0);
     sheets.push({
-      name: sheetName, rows: rows,
+      name: sheetName, rows,
       rowCount: rows.length,
       colCount: Math.max(...rows.map(r => r.length), 0),
     });
@@ -115,17 +121,21 @@ export default function ProjectDetailPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  // 텍스트 추출 상태
   const [extracting, setExtracting] = useState(false);
   const [extractProgress, setExtractProgress] = useState({ step: '', current: 0, total: 0 });
   const [extractResults, setExtractResults] = useState(null);
   const [extractError, setExtractError] = useState(null);
 
-  // AI 검토 상태
   const [reviewing, setReviewing] = useState(false);
   const [reviewProgress, setReviewProgress] = useState('');
   const [reviewResult, setReviewResult] = useState(null);
   const [reviewError, setReviewError] = useState(null);
+
+  const [naeyeokseoFile, setNaeyeokseoFile] = useState(null);
+  const [suryangsanchulFiles, setSuryangsanchulFiles] = useState([]);
+  const [uploadingValidation, setUploadingValidation] = useState(false);
+  const [validationUploadProgress, setValidationUploadProgress] = useState('');
+  const [validationUploadDone, setValidationUploadDone] = useState(false);
 
   useEffect(() => {
     async function fetchProjectData() {
@@ -150,122 +160,119 @@ export default function ProjectDetailPage() {
     fetchProjectData();
   }, [projectId]);
 
-  // Excel 추출 (기존 기능)
   const handleExtractText = async () => {
     setExtracting(true);
     setExtractError(null);
     setExtractResults(null);
-
     try {
-      const excelDocs = documents.filter(doc => {
-        const name = (doc.filename || '').toLowerCase();
-        return name.endsWith('.xlsx') || name.endsWith('.xls');
-      });
-
-      if (excelDocs.length === 0) throw new Error('Excel 파일이 없습니다.');
-
-      const totalFiles = excelDocs.length;
+      const crossDocs = documents.filter(doc =>
+        CROSS_CATEGORIES.includes(doc.category) &&
+        ['.xlsx', '.xls'].some(ext => (doc.filename || '').toLowerCase().endsWith(ext))
+      );
+      if (crossDocs.length === 0) throw new Error('교차 검토용 Excel 파일이 없습니다.');
       const results = [];
-
-      for (let i = 0; i < totalFiles; i++) {
-        const doc = excelDocs[i];
+      for (let i = 0; i < crossDocs.length; i++) {
+        const doc = crossDocs[i];
         const label = FILE_CATEGORY_LABELS[doc.category] || doc.category;
-        setExtractProgress({ step: `파싱 중: ${label}`, current: i + 1, total: totalFiles });
-
+        setExtractProgress({ step: `파싱 중: ${label}`, current: i + 1, total: crossDocs.length });
         try {
           const parseResult = await fetchAndParseExcel(supabase, doc.storage_path);
-          results.push({
-            documentId: doc.id, category: doc.category, label, filename: doc.filename,
-            fileSize: doc.file_size, success: true, ...parseResult,
-          });
+          results.push({ documentId: doc.id, category: doc.category, label, filename: doc.filename, fileSize: doc.file_size, success: true, ...parseResult });
         } catch (err) {
-          results.push({
-            documentId: doc.id, category: doc.category, label, filename: doc.filename,
-            success: false, error: err.message,
-          });
+          results.push({ documentId: doc.id, category: doc.category, label, filename: doc.filename, success: false, error: err.message });
         }
       }
-
-      setExtractProgress({ step: '완료!', current: totalFiles, total: totalFiles });
+      setExtractProgress({ step: '완료!', current: crossDocs.length, total: crossDocs.length });
       setExtractResults(results);
       setTimeout(() => setExtractProgress({ step: '', current: 0, total: 0 }), 500);
     } catch (err) {
-      console.error('추출 에러:', err);
       setExtractError(err.message);
     } finally {
       setExtracting(false);
     }
   };
 
-  // 🔥 AI 검토 (새 기능!)
   const handleAiReview = async () => {
     setReviewing(true);
     setReviewError(null);
     setReviewResult(null);
-
     try {
-      // 1. Excel 파일들 추출
       setReviewProgress('📄 Excel 파일 분석 준비 중...');
-      const excelDocs = documents.filter(doc => {
-        const name = (doc.filename || '').toLowerCase();
-        return name.endsWith('.xlsx') || name.endsWith('.xls');
-      });
-
-      if (excelDocs.length === 0) throw new Error('Excel 파일이 없습니다. (PDF는 보관용)');
-
+      const crossDocs = documents.filter(doc =>
+        CROSS_CATEGORIES.includes(doc.category) &&
+        ['.xlsx', '.xls'].some(ext => (doc.filename || '').toLowerCase().endsWith(ext))
+      );
+      if (crossDocs.length === 0) throw new Error('교차 검토용 Excel 파일이 없습니다.');
       const excelData = [];
-      for (let i = 0; i < excelDocs.length; i++) {
-        const doc = excelDocs[i];
+      for (let i = 0; i < crossDocs.length; i++) {
+        const doc = crossDocs[i];
         const label = FILE_CATEGORY_LABELS[doc.category] || doc.category;
-        setReviewProgress(`📄 추출 중: ${label} (${i + 1}/${excelDocs.length})`);
-
+        setReviewProgress(`📄 추출 중: ${label} (${i + 1}/${crossDocs.length})`);
         const parseResult = await fetchAndParseExcel(supabase, doc.storage_path);
-        excelData.push({
-          category: doc.category,
-          label,
-          filename: doc.filename,
-          summary: parseResult.summary,
-          sheets: parseResult.sheets,
-        });
+        excelData.push({ category: doc.category, label, filename: doc.filename, summary: parseResult.summary, sheets: parseResult.sheets });
       }
-
-      // 2. AI 검토 API 호출
       setReviewProgress('🤖 Claude AI가 검토 중... (최대 30초 소요)');
-
       const response = await fetch('/api/review', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          projectId,
-          projectName: project.name,
-          excelData,
-        }),
+        body: JSON.stringify({ projectId, projectName: project.name, excelData }),
       });
-
       const data = await response.json();
-
       if (!response.ok) {
-         // 🔥 사용량 한도 초과 (429)
-         if (response.status === 429 && data.limit) {
+        if (response.status === 429 && data.limit) {
           const nextReset = new Date(data.nextResetDate);
           const daysLeft = Math.ceil((nextReset - new Date()) / (1000 * 60 * 60 * 24));
-          throw new Error(
-            `이번 달 검토 한도(${data.limit}회)를 모두 사용했습니다. ${daysLeft}일 후에 다시 사용 가능합니다.`
-          );
+          throw new Error(`이번 달 검토 한도(${data.limit}회)를 모두 사용했습니다. ${daysLeft}일 후에 다시 사용 가능합니다.`);
         }
         throw new Error(data.error || 'AI 검토 실패');
       }
-
-      // 3. 결과 표시
       setReviewProgress('✅ 검토 완료!');
       setReviewResult(data);
-
       setTimeout(() => setReviewProgress(''), 1000);
     } catch (err) {
-      console.error('AI 검토 에러:', err);
       setReviewError(err.message);
     } finally {
       setReviewing(false);
+    }
+  };
+
+  const handleValidationUpload = async () => {
+    if (!naeyeokseoFile) { alert('내역서 파일을 선택해주세요.'); return; }
+    if (suryangsanchulFiles.length === 0) { alert('수량산출서 파일을 1개 이상 선택해주세요.'); return; }
+    setUploadingValidation(true);
+    setValidationUploadProgress('');
+    setValidationUploadDone(false);
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) throw new Error('로그인이 필요합니다.');
+      const allFiles = [
+        { file: naeyeokseoFile, category: 'naeyeokseo' },
+        ...suryangsanchulFiles.map(f => ({ file: f, category: 'suryangsanchul' })),
+      ];
+      for (let i = 0; i < allFiles.length; i++) {
+        const { file, category } = allFiles[i];
+        setValidationUploadProgress(`업로드 중: ${FILE_CATEGORY_LABELS[category]} - ${file.name} (${i + 1}/${allFiles.length})`);
+        const ext = file.name.split('.').pop();
+        const storagePath = `${user.id}/${projectId}/${category}_${Date.now()}_${i}.${ext}`;
+        const { error: uploadError } = await supabase.storage.from('project-files').upload(storagePath, file, { upsert: true });
+        if (uploadError) throw new Error(`업로드 실패: ${file.name} - ${uploadError.message}`);
+        const { error: dbError } = await supabase.from('documents').insert({
+          project_id: projectId, user_id: user.id, category,
+          filename: file.name, file_size: file.size, storage_path: storagePath,
+        });
+        if (dbError) throw new Error(`DB 저장 실패: ${file.name} - ${dbError.message}`);
+      }
+      setValidationUploadProgress('✅ 업로드 완료!');
+      setValidationUploadDone(true);
+      setNaeyeokseoFile(null);
+      setSuryangsanchulFiles([]);
+      const { data: docsData } = await supabase.from('documents').select('*').eq('project_id', projectId).order('created_at', { ascending: true });
+      setDocuments(docsData || []);
+      setTimeout(() => setValidationUploadProgress(''), 2000);
+    } catch (err) {
+      setValidationUploadProgress(`❌ 오류: ${err.message}`);
+    } finally {
+      setUploadingValidation(false);
     }
   };
 
@@ -297,10 +304,11 @@ export default function ProjectDetailPage() {
   }
 
   const status = STATUS_BADGES[project.status] || STATUS_BADGES.pending;
-  const excelDocsCount = documents.filter(doc => {
-    const name = (doc.filename || '').toLowerCase();
-    return name.endsWith('.xlsx') || name.endsWith('.xls');
-  }).length;
+  const validationDocs = documents.filter(doc => VALIDATION_CATEGORIES.includes(doc.category));
+  const crossDocs = documents.filter(doc => CROSS_CATEGORIES.includes(doc.category));
+  const crossExcelCount = crossDocs.filter(doc =>
+    ['.xlsx', '.xls'].some(ext => (doc.filename || '').toLowerCase().endsWith(ext))
+  ).length;
 
   return (
     <div className="min-h-screen bg-gray-50 py-8 px-4">
@@ -313,25 +321,134 @@ export default function ProjectDetailPage() {
             <h1 className="text-2xl font-bold text-gray-900 flex-1">🏗️ {project.name}</h1>
             <span className={`ml-3 px-3 py-1 text-xs font-semibold rounded-full ${status.className}`}>{status.label}</span>
           </div>
-          <div className="text-sm text-gray-500 space-x-4">
+          <div className="text-sm text-gray-500">
             <span>📅 생성: {formatDate(project.created_at)}</span>
           </div>
         </div>
 
-        {/* 파일 목록 */}
+        {/* ⭐ 내역서 검증 섹션 */}
+        <div className="bg-white rounded-lg shadow-sm border border-blue-300 p-5 mb-4">
+          <div className="flex items-center gap-2 mb-4">
+            <span className="text-lg">⭐</span>
+            <h2 className="text-base font-semibold text-blue-900">내역서 검증</h2>
+            <span className="text-xs px-2 py-0.5 bg-blue-100 text-blue-700 rounded-full">NEW</span>
+          </div>
+
+          <div className="mb-4">
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              📋 내역서 <span className="text-red-500">*</span>
+              <span className="text-xs font-normal text-gray-500 ml-1">(1개, Excel)</span>
+            </label>
+            <input type="file" accept=".xlsx,.xls,.XLS,.XLSX"
+              onChange={e => setNaeyeokseoFile(e.target.files[0] || null)}
+              className="block w-full text-sm text-gray-700 border border-gray-300 rounded-lg px-3 py-2 cursor-pointer hover:border-blue-400 transition"
+            />
+            {naeyeokseoFile && (
+              <div className="mt-2 flex items-center gap-2 px-3 py-2 bg-blue-50 border border-blue-200 rounded-lg">
+                <span>📋</span>
+                <span className="text-sm text-blue-800 truncate flex-1">{naeyeokseoFile.name}</span>
+                <span className="text-xs text-gray-500">{formatFileSize(naeyeokseoFile.size)}</span>
+                <button onClick={() => setNaeyeokseoFile(null)} className="text-red-400 hover:text-red-600 text-xs flex-shrink-0">❌</button>
+              </div>
+            )}
+          </div>
+
+          <div className="mb-4">
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              📊 수량산출서 <span className="text-red-500">*</span>
+              <span className="text-xs font-normal text-gray-500 ml-1">(여러 개 가능, Excel)</span>
+            </label>
+            <input type="file" accept=".xlsx,.xls,.XLS,.XLSX" multiple
+              onChange={e => {
+                const newFiles = Array.from(e.target.files);
+                setSuryangsanchulFiles(prev => {
+                  const existing = prev.map(f => f.name);
+                  return [...prev, ...newFiles.filter(f => !existing.includes(f.name))];
+                });
+                e.target.value = '';
+              }}
+              className="block w-full text-sm text-gray-700 border border-gray-300 rounded-lg px-3 py-2 cursor-pointer hover:border-blue-400 transition"
+            />
+            {suryangsanchulFiles.length > 0 && (
+              <div className="mt-2 space-y-1">
+                {suryangsanchulFiles.map((file, idx) => (
+                  <div key={idx} className="flex items-center gap-2 px-3 py-2 bg-green-50 border border-green-200 rounded-lg">
+                    <span>📊</span>
+                    <span className="text-sm text-green-800 truncate flex-1">{file.name}</span>
+                    <span className="text-xs text-gray-500">{formatFileSize(file.size)}</span>
+                    <button onClick={() => setSuryangsanchulFiles(prev => prev.filter((_, i) => i !== idx))}
+                      className="text-red-400 hover:text-red-600 text-xs flex-shrink-0">❌</button>
+                  </div>
+                ))}
+                <p className="text-xs text-gray-500 mt-1">총 {suryangsanchulFiles.length}개 선택됨</p>
+              </div>
+            )}
+          </div>
+
+          <button onClick={handleValidationUpload}
+            disabled={uploadingValidation || !naeyeokseoFile || suryangsanchulFiles.length === 0}
+            className="w-full px-4 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition text-sm font-medium">
+            {uploadingValidation ? '⏳ 업로드 중...' : '📤 내역서 + 수량산출서 업로드'}
+          </button>
+
+          {validationUploadProgress && (
+            <div className={`mt-3 px-3 py-2 rounded-lg text-sm ${
+              validationUploadProgress.startsWith('❌') ? 'bg-red-50 text-red-700 border border-red-200' :
+              validationUploadProgress.startsWith('✅') ? 'bg-green-50 text-green-700 border border-green-200' :
+              'bg-blue-50 text-blue-700 border border-blue-200'
+            }`}>
+              {uploadingValidation && !validationUploadProgress.startsWith('✅') && (
+                <span className="inline-block w-3 h-3 border-2 border-current border-t-transparent rounded-full animate-spin mr-2 align-middle"></span>
+              )}
+              {validationUploadProgress}
+            </div>
+          )}
+
+          {validationUploadDone && (
+            <div className="mt-3 p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
+              <p className="text-sm text-yellow-800">✅ 업로드 완료! 곧 검증 기능이 추가됩니다.</p>
+            </div>
+          )}
+
+          {/* 업로드된 내역서/수량산출서 목록 */}
+          {validationDocs.length > 0 && (
+            <div className="mt-4 pt-4 border-t border-blue-100">
+              <h3 className="text-sm font-medium text-gray-700 mb-2">
+                📎 업로드된 파일 <span className="text-gray-400">({validationDocs.length}개)</span>
+              </h3>
+              <div className="space-y-1">
+                {validationDocs.map((doc) => {
+                  const isExcel = ['.xlsx', '.xls'].some(ext => (doc.filename || '').toLowerCase().endsWith(ext));
+                  return (
+                    <div key={doc.id} className="flex items-center gap-3 px-3 py-2 bg-blue-50 border border-blue-200 rounded-lg">
+                      <span className="text-base flex-shrink-0">{FILE_CATEGORY_EMOJIS[doc.category] || '📄'}</span>
+                      <span className="text-sm font-medium text-gray-900 w-24 flex-shrink-0">{FILE_CATEGORY_LABELS[doc.category] || doc.category}</span>
+                      <span className="text-sm flex-shrink-0">{isExcel ? '📗' : '📄'}</span>
+                      <span className="text-sm text-gray-700 truncate flex-1 min-w-0">{doc.filename}</span>
+                      <span className="text-xs text-gray-500 flex-shrink-0">{formatFileSize(doc.file_size)}</span>
+                      {isExcel && <span className="text-xs px-2 py-0.5 bg-green-100 text-green-700 rounded flex-shrink-0">분석 대상</span>}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* 📋 5개 파일 교차 검토 섹션 */}
         <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-5 mb-4">
-          <h2 className="text-base font-semibold text-gray-900 mb-4">
-            📎 업로드된 파일 <span className="text-sm font-normal text-gray-500">({documents.length}개)</span>
-          </h2>
-          {documents.length === 0 ? (
-            <p className="text-sm text-gray-500 text-center py-4">업로드된 파일이 없습니다.</p>
-          ) : (
-            <div className="space-y-2">
-              {documents.map((doc) => {
-                const isExcel = ['xlsx', 'xls'].some(ext => (doc.filename || '').toLowerCase().endsWith(ext));
+          <div className="flex items-center gap-2 mb-4">
+            <span className="text-lg">📋</span>
+            <h2 className="text-base font-semibold text-gray-900">5개 파일 교차 검토</h2>
+          </div>
+
+          {crossDocs.length > 0 ? (
+            <div className="space-y-1 mb-4">
+              {crossDocs.map((doc) => {
+                const isExcel = ['.xlsx', '.xls'].some(ext => (doc.filename || '').toLowerCase().endsWith(ext));
                 const isPdf = (doc.filename || '').toLowerCase().endsWith('pdf');
                 return (
-                  <div key={doc.id} className="flex items-center gap-3 px-3 py-2 bg-blue-50 border border-blue-200 rounded-lg">
+                  <div key={doc.id} className="flex items-center gap-3 px-3 py-2 bg-gray-50 border border-gray-200 rounded-lg">
                     <span className="text-base flex-shrink-0">{FILE_CATEGORY_EMOJIS[doc.category] || '📄'}</span>
                     <span className="text-sm font-medium text-gray-900 w-24 flex-shrink-0">{FILE_CATEGORY_LABELS[doc.category] || doc.category}</span>
                     <span className="text-sm flex-shrink-0">{isPdf ? '📕' : isExcel ? '📗' : '📄'}</span>
@@ -343,20 +460,17 @@ export default function ProjectDetailPage() {
                 );
               })}
             </div>
+          ) : (
+            <p className="text-sm text-gray-500 text-center py-4 mb-4">업로드된 파일이 없습니다.</p>
           )}
-        </div>
 
-        {/* 액션 버튼 */}
-        <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-5 mb-4">
-          <h2 className="text-base font-semibold text-gray-900 mb-3">🎯 다음 단계</h2>
           <div className="space-y-2">
-            <button onClick={handleExtractText} disabled={extracting || reviewing || excelDocsCount === 0}
+            <button onClick={handleExtractText} disabled={extracting || reviewing || crossExcelCount === 0}
               className="w-full px-4 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition text-sm font-medium text-left">
               {extracting ? '⏳ 추출 중...' : '📊 Excel 텍스트 추출 미리보기'}
-              <span className="block text-xs font-normal text-blue-100 mt-0.5">Excel 파일 {excelDocsCount}개를 분석 가능한 텍스트로 변환</span>
+              <span className="block text-xs font-normal text-blue-100 mt-0.5">Excel 파일 {crossExcelCount}개를 분석 가능한 텍스트로 변환</span>
             </button>
-
-            <button onClick={handleAiReview} disabled={reviewing || extracting || excelDocsCount === 0}
+            <button onClick={handleAiReview} disabled={reviewing || extracting || crossExcelCount === 0}
               className="w-full px-4 py-3 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed transition text-sm font-medium text-left">
               {reviewing ? '🤖 AI 검토 진행 중...' : '🤖 AI 검토 시작 (Claude)'}
               <span className="block text-xs font-normal text-purple-100 mt-0.5">Claude AI가 단가 검증 및 이슈 발견 (소요시간 ~30초)</span>
@@ -364,7 +478,7 @@ export default function ProjectDetailPage() {
           </div>
         </div>
 
-        {/* Excel 추출 진행 */}
+        {/* 결과 패널들 */}
         {extracting && extractProgress.step && (
           <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-4">
             <div className="flex items-center gap-3 mb-2">
@@ -374,8 +488,7 @@ export default function ProjectDetailPage() {
             {extractProgress.total > 0 && (
               <div className="ml-8">
                 <div className="flex justify-between text-xs text-blue-700 mb-1">
-                  <span>진행률</span>
-                  <span>{extractProgress.current} / {extractProgress.total}</span>
+                  <span>진행률</span><span>{extractProgress.current} / {extractProgress.total}</span>
                 </div>
                 <div className="w-full bg-blue-200 rounded-full h-2">
                   <div className="bg-blue-600 h-2 rounded-full transition-all duration-300" style={{ width: `${(extractProgress.current / extractProgress.total) * 100}%` }}></div>
@@ -391,7 +504,6 @@ export default function ProjectDetailPage() {
           </div>
         )}
 
-        {/* Excel 추출 결과 */}
         {extractResults && (
           <div className="space-y-4 mb-4">
             <div className="bg-green-50 border border-green-200 rounded-lg p-4">
@@ -404,7 +516,6 @@ export default function ProjectDetailPage() {
           </div>
         )}
 
-        {/* 🔥 AI 검토 진행 */}
         {reviewing && reviewProgress && (
           <div className="bg-purple-50 border border-purple-200 rounded-lg p-4 mb-4">
             <div className="flex items-center gap-3">
@@ -420,7 +531,6 @@ export default function ProjectDetailPage() {
           </div>
         )}
 
-        {/* 🔥 AI 검토 결과 */}
         {reviewResult && reviewResult.result && (
           <ReviewResultPanel data={reviewResult} />
         )}
@@ -429,10 +539,8 @@ export default function ProjectDetailPage() {
   );
 }
 
-// Excel 추출 결과 카드
 function ExtractResultCard({ result }) {
   const [expanded, setExpanded] = useState(false);
-
   if (!result.success) {
     return (
       <div className="bg-red-50 border border-red-200 rounded-lg p-4">
@@ -442,7 +550,6 @@ function ExtractResultCard({ result }) {
       </div>
     );
   }
-
   return (
     <div className="bg-white border border-gray-200 rounded-lg overflow-hidden">
       <div className="px-4 py-3 bg-gray-50 border-b border-gray-200 cursor-pointer hover:bg-gray-100 transition" onClick={() => setExpanded(!expanded)}>
@@ -454,7 +561,6 @@ function ExtractResultCard({ result }) {
           <span className="text-xs text-gray-500 flex-shrink-0 ml-3">{expanded ? '▼ 접기' : '▶ 펼치기'}</span>
         </div>
       </div>
-
       {expanded && (
         <div className="p-4 space-y-4">
           {result.sheets.map((sheet, sheetIdx) => (
@@ -473,12 +579,12 @@ function ExtractResultCard({ result }) {
                           {row.slice(0, 8).map((cell, cellIdx) => (
                             <td key={cellIdx} className="border border-gray-200 px-2 py-1 truncate max-w-[150px]">{String(cell || '')}</td>
                           ))}
-                          {row.length > 8 && (<td className="border border-gray-200 px-2 py-1 text-gray-400 italic">... +{row.length - 8}열</td>)}
+                          {row.length > 8 && <td className="border border-gray-200 px-2 py-1 text-gray-400 italic">... +{row.length - 8}열</td>}
                         </tr>
                       ))}
                     </tbody>
                   </table>
-                  {sheet.rows.length > 10 && (<p className="text-xs text-gray-500 mt-1 italic">... 외 {sheet.rows.length - 10}행 더 있음</p>)}
+                  {sheet.rows.length > 10 && <p className="text-xs text-gray-500 mt-1 italic">... 외 {sheet.rows.length - 10}행 더 있음</p>}
                 </div>
               )}
             </div>
@@ -489,25 +595,19 @@ function ExtractResultCard({ result }) {
   );
 }
 
-// 🔥 AI 검토 결과 패널
 function ReviewResultPanel({ data }) {
   const { result, usage } = data;
   const { summary, totalIssues, severity, issues, recommendations } = result;
-
   return (
     <div className="space-y-4">
-      {/* 요약 */}
       <div className="bg-purple-50 border border-purple-200 rounded-lg p-5">
         <div className="flex items-center justify-between mb-3">
           <h2 className="text-lg font-semibold text-purple-900">🤖 Claude AI 검토 완료</h2>
           {usage && (
-            <span className="text-xs text-purple-600">
-              ⏱ {usage.elapsedSeconds}초 · {(usage.inputTokens + usage.outputTokens).toLocaleString()} 토큰
-            </span>
+            <span className="text-xs text-purple-600">⏱ {usage.elapsedSeconds}초 · {(usage.inputTokens + usage.outputTokens).toLocaleString()} 토큰</span>
           )}
         </div>
         <p className="text-sm text-purple-800 mb-4 leading-relaxed">{summary}</p>
-
         <div className="grid grid-cols-3 gap-2">
           <div className="bg-red-100 rounded p-2 text-center">
             <p className="text-xs text-red-700">🔴 심각</p>
@@ -523,22 +623,16 @@ function ReviewResultPanel({ data }) {
           </div>
         </div>
       </div>
-
-      {/* 이슈 목록 */}
       {issues && issues.length > 0 && (
         <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-5">
           <h2 className="text-base font-semibold text-gray-900 mb-4">
             🔍 발견된 이슈 <span className="text-sm font-normal text-gray-500">({totalIssues}개)</span>
           </h2>
           <div className="space-y-3">
-            {issues.map((issue) => (
-              <IssueCard key={issue.id} issue={issue} />
-            ))}
+            {issues.map((issue) => <IssueCard key={issue.id} issue={issue} />)}
           </div>
         </div>
       )}
-
-      {/* 권장사항 */}
       {recommendations && recommendations.length > 0 && (
         <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-5">
           <h2 className="text-base font-semibold text-gray-900 mb-3">💡 종합 권장사항</h2>
@@ -556,28 +650,21 @@ function ReviewResultPanel({ data }) {
   );
 }
 
-// 이슈 카드 (펼치기 가능)
 function IssueCard({ issue }) {
   const [expanded, setExpanded] = useState(false);
   const style = SEVERITY_STYLES[issue.severity] || SEVERITY_STYLES.info;
-
   return (
     <div className={`border ${style.borderColor} ${style.bgColor} rounded-lg overflow-hidden`}>
       <div className="px-4 py-3 cursor-pointer hover:bg-opacity-70 transition" onClick={() => setExpanded(!expanded)}>
         <div className="flex items-center justify-between gap-3">
           <div className="flex items-center gap-2 flex-1 min-w-0">
-            <span className={`px-2 py-0.5 text-xs font-medium rounded ${style.badgeColor} flex-shrink-0`}>
-              {style.label}
-            </span>
+            <span className={`px-2 py-0.5 text-xs font-medium rounded ${style.badgeColor} flex-shrink-0`}>{style.label}</span>
             <span className="text-xs text-gray-500 flex-shrink-0">[{issue.category}]</span>
-            <h3 className={`text-sm font-medium ${style.titleColor} truncate`}>
-              {issue.title}
-            </h3>
+            <h3 className={`text-sm font-medium ${style.titleColor} truncate`}>{issue.title}</h3>
           </div>
           <span className="text-xs text-gray-500 flex-shrink-0">{expanded ? '▼' : '▶'}</span>
         </div>
       </div>
-
       {expanded && (
         <div className="px-4 pb-4 pt-1 space-y-3 text-sm">
           <div>
