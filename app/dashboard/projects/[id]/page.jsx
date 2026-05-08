@@ -136,6 +136,11 @@ export default function ProjectDetailPage() {
   const [uploadingValidation, setUploadingValidation] = useState(false);
   const [validationUploadProgress, setValidationUploadProgress] = useState('');
   const [validationUploadDone, setValidationUploadDone] = useState(false);
+  // 내역서 검증 결과 상태
+  const [validating, setValidating] = useState(false);
+  const [validationProgress, setValidationProgress] = useState('');
+  const [validationResult, setValidationResult] = useState(null);
+  const [validationError, setValidationError] = useState(null);
 
   useEffect(() => {
     async function fetchProjectData() {
@@ -235,7 +240,16 @@ export default function ProjectDetailPage() {
       setReviewing(false);
     }
   };
-
+  const handleDeleteDoc = async (docId, storagePath) => {
+    if (!confirm('이 파일을 삭제하시겠습니까?')) return;
+    try {
+      await supabase.storage.from('project-files').remove([storagePath]);
+      await supabase.from('documents').delete().eq('id', docId);
+      setDocuments(prev => prev.filter(d => d.id !== docId));
+    } catch (err) {
+      alert('삭제 실패: ' + err.message);
+    }
+  };
   const handleValidationUpload = async () => {
     if (!naeyeokseoFile) { alert('내역서 파일을 선택해주세요.'); return; }
     if (suryangsanchulFiles.length === 0) { alert('수량산출서 파일을 1개 이상 선택해주세요.'); return; }
@@ -273,6 +287,36 @@ export default function ProjectDetailPage() {
       setValidationUploadProgress(`❌ 오류: ${err.message}`);
     } finally {
       setUploadingValidation(false);
+    }
+  };
+  const handleValidation = async () => {
+    setValidating(true);
+    setValidationError(null);
+    setValidationResult(null);
+
+    try {
+      setValidationProgress('🔍 내역서 및 수량산출서 분석 중...');
+
+      const response = await fetch('/api/review/validate-estimate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || '검증 실패');
+      }
+
+      setValidationProgress('✅ 검증 완료!');
+      setValidationResult(data);
+      setTimeout(() => setValidationProgress(''), 1000);
+    } catch (err) {
+      console.error('검증 에러:', err);
+      setValidationError(err.message);
+    } finally {
+      setValidating(false);
     }
   };
 
@@ -404,11 +448,24 @@ export default function ProjectDetailPage() {
             </div>
           )}
 
-          {validationUploadDone && (
-            <div className="mt-3 p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
-              <p className="text-sm text-yellow-800">✅ 업로드 완료! 곧 검증 기능이 추가됩니다.</p>
+{validationUploadDone && (
+            <div className="mt-3 p-3 bg-green-50 border border-green-200 rounded-lg">
+              <p className="text-sm text-green-800">✅ 업로드 완료! 아래 검증 시작 버튼을 눌러주세요.</p>
             </div>
           )}
+
+          {/* 검증 시작 버튼 */}
+          {validationDocs.length > 0 && (
+            <button
+              onClick={handleValidation}
+              disabled={validating}
+              className="mt-4 w-full px-4 py-3 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed transition text-sm font-medium">
+              {validating ? '🔍 검증 중...' : '🔍 내역서 검증 시작'}
+              <span className="block text-xs font-normal text-green-100 mt-0.5">내역서 수량과 수량산출서 집계를 AI가 비교 검증합니다</span>
+            </button>
+          )}
+
+
 
           {/* 업로드된 내역서/수량산출서 목록 */}
           {validationDocs.length > 0 && (
@@ -427,6 +484,9 @@ export default function ProjectDetailPage() {
                       <span className="text-sm text-gray-700 truncate flex-1 min-w-0">{doc.filename}</span>
                       <span className="text-xs text-gray-500 flex-shrink-0">{formatFileSize(doc.file_size)}</span>
                       {isExcel && <span className="text-xs px-2 py-0.5 bg-green-100 text-green-700 rounded flex-shrink-0">분석 대상</span>}
+                      <button
+                        onClick={() => handleDeleteDoc(doc.id, doc.storage_path)}
+                        className="text-red-400 hover:text-red-600 text-xs flex-shrink-0 ml-1">❌</button>
                     </div>
                   );
                 })}
@@ -534,6 +594,112 @@ export default function ProjectDetailPage() {
         {reviewResult && reviewResult.result && (
           <ReviewResultPanel data={reviewResult} />
         )}
+        {/* 검증 진행 */}
+        {validating && (
+          <div className="bg-green-50 border border-green-200 rounded-lg p-4 mb-4">
+            <div className="flex items-center gap-3">
+              <div className="w-5 h-5 border-2 border-green-600 border-t-transparent rounded-full animate-spin"></div>
+              <p className="text-sm font-medium text-green-900">{validationProgress}</p>
+            </div>
+          </div>
+        )}
+
+        {validationError && (
+          <div className="bg-red-50 border border-red-200 rounded-lg p-4 mb-4">
+            <p className="text-sm text-red-700">⚠️ 검증 실패: {validationError}</p>
+          </div>
+        )}
+
+        {validationResult && validationResult.result && (
+          <ValidationResultPanel data={validationResult} />
+        )}
+      </div>
+    </div>
+  );
+}
+// 검증 결과 패널
+function ValidationResultPanel({ data }) {
+  const { result, usage } = data;
+  const { results, summary } = result;
+
+  return (
+    <div className="space-y-4 mb-4">
+      {/* 요약 */}
+      <div className="bg-green-50 border border-green-200 rounded-lg p-5">
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-lg font-semibold text-green-900">🔍 내역서 검증 완료</h2>
+          {usage && (
+            <span className="text-xs text-green-600">⏱ {usage.elapsedSeconds}초</span>
+          )}
+        </div>
+        <div className="grid grid-cols-3 gap-2">
+          <div className="bg-green-100 rounded p-2 text-center">
+            <p className="text-xs text-green-700">✅ 일치</p>
+            <p className="text-2xl font-bold text-green-700">{summary?.matched_ok || 0}</p>
+          </div>
+          <div className="bg-red-100 rounded p-2 text-center">
+            <p className="text-xs text-red-700">⚠️ 불일치</p>
+            <p className="text-2xl font-bold text-red-700">{summary?.matched_diff || 0}</p>
+          </div>
+          <div className="bg-gray-100 rounded p-2 text-center">
+            <p className="text-xs text-gray-700">❓ 매칭실패</p>
+            <p className="text-2xl font-bold text-gray-700">{summary?.unmatched || 0}</p>
+          </div>
+        </div>
+      </div>
+
+      {/* 결과 테이블 */}
+      <div className="bg-white rounded-lg shadow-sm border border-gray-200 overflow-hidden">
+        <div className="px-5 py-3 bg-gray-50 border-b border-gray-200">
+          <h2 className="text-base font-semibold text-gray-900">
+            📋 품목별 검증 결과
+            <span className="ml-2 text-sm font-normal text-gray-500">({results?.length || 0}개)</span>
+          </h2>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="min-w-full text-sm">
+            <thead>
+              <tr className="bg-gray-50 border-b border-gray-200">
+                <th className="px-3 py-2 text-left text-xs font-medium text-gray-600">공종명</th>
+                <th className="px-3 py-2 text-left text-xs font-medium text-gray-600">규격</th>
+                <th className="px-3 py-2 text-left text-xs font-medium text-gray-600">단위</th>
+                <th className="px-3 py-2 text-right text-xs font-medium text-gray-600">내역서 수량</th>
+                <th className="px-3 py-2 text-right text-xs font-medium text-gray-600">산출서 수량</th>
+                <th className="px-3 py-2 text-right text-xs font-medium text-gray-600">차이</th>
+                <th className="px-3 py-2 text-center text-xs font-medium text-gray-600">상태</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {results?.map((item, idx) => (
+                <tr key={idx} className="hover:bg-gray-50">
+                  <td className="px-3 py-2 text-xs text-gray-900 max-w-[180px] truncate">{item.naeyeokseo_item}</td>
+                  <td className="px-3 py-2 text-xs text-gray-600 max-w-[100px] truncate">{item.gyugyeok || '-'}</td>
+                  <td className="px-3 py-2 text-xs text-gray-600">{item.danwi}</td>
+                  <td className={`px-3 py-2 text-xs text-right font-medium ${
+                    item.status === '불일치' ? 'bg-red-50 text-red-700' :
+                    item.status === '일치' ? 'text-green-700' : 'text-gray-500'
+                  }`}>
+                    {item.naeyeokseo_suryang?.toLocaleString() || '-'}
+                  </td>
+                  <td className="px-3 py-2 text-xs text-right text-gray-700">
+                    {item.sanchul_suryang?.toLocaleString() || '-'}
+                  </td>
+                  <td className={`px-3 py-2 text-xs text-right font-medium ${
+                    item.difference > 0 ? 'text-red-600' :
+                    item.difference < 0 ? 'text-blue-600' : 'text-gray-400'
+                  }`}>
+                    {item.difference != null ? (item.difference > 0 ? '+' : '') + item.difference.toLocaleString() : '-'}
+                  </td>
+                  <td className="px-3 py-2 text-xs text-center">
+                    {item.status === '일치' && <span className="px-2 py-0.5 bg-green-100 text-green-700 rounded-full">✅ 일치</span>}
+                    {item.status === '불일치' && <span className="px-2 py-0.5 bg-red-100 text-red-700 rounded-full">⚠️ 불일치</span>}
+                    {item.status === '매칭실패' && <span className="px-2 py-0.5 bg-gray-100 text-gray-600 rounded-full">❓ 매칭실패</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   );
