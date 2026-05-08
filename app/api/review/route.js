@@ -6,10 +6,12 @@ const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
+// 🔥 사용량 제한 설정
+const MONTHLY_REVIEW_LIMIT = 5;  // 월 5회 무료
+
 /**
  * POST /api/review
- * Body: { projectId, projectName, excelData }
- * AI 검토 + DB 저장
+ * 사용량 체크 → AI 검토 → DB 저장
  */
 export async function POST(request) {
   try {
@@ -21,7 +23,36 @@ export async function POST(request) {
       return NextResponse.json({ error: '로그인이 필요합니다.' }, { status: 401 });
     }
 
-    // 2. 요청 데이터
+    // 2. 🔥 사용량 체크!
+
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+
+  const { count: monthlyUsed } = await supabase
+    .from('reviews')
+    .select('id', { count: 'exact', head: true })
+    .eq('user_id', user.id)
+    .gte('created_at', monthStart.toISOString());
+
+  if ((monthlyUsed || 0) >= MONTHLY_REVIEW_LIMIT) {
+    const nextResetDate = new Date(
+      now.getFullYear(),
+      now.getMonth() + 1,
+      1
+    ).toISOString();
+
+    return NextResponse.json(
+      {
+        error: '월간 한도 초과',
+        limit: MONTHLY_REVIEW_LIMIT,
+        used: monthlyUsed,
+        nextResetDate,
+      },
+      { status: 429 }
+    );
+  }
+
+    // 3. 요청 데이터
     const body = await request.json();
     const { projectId, projectName, excelData } = body;
 
@@ -29,7 +60,7 @@ export async function POST(request) {
       return NextResponse.json({ error: '필수 데이터 누락' }, { status: 400 });
     }
 
-    // 3. 프로젝트 소유권 확인
+    // 4. 프로젝트 소유권 확인
     const { data: project, error: projectError } = await supabase
       .from('projects')
       .select('*')
@@ -41,10 +72,10 @@ export async function POST(request) {
       return NextResponse.json({ error: '프로젝트 접근 불가' }, { status: 403 });
     }
 
-    // 4. 프롬프트 생성
+    // 5. 프롬프트 생성
     const prompt = buildReviewPrompt(projectName || project.name, excelData);
 
-    // 5. Claude API 호출
+    // 6. Claude API 호출
     console.log('[AI 검토] Claude API 호출 시작...');
     const startTime = Date.now();
 
@@ -57,7 +88,7 @@ export async function POST(request) {
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
     console.log(`[AI 검토] 완료! 소요시간: ${elapsed}초`);
 
-    // 6. 응답 파싱
+    // 7. 응답 파싱
     const responseText = message.content[0].text;
     let parsedResult;
     try {
@@ -80,7 +111,7 @@ export async function POST(request) {
       elapsedSeconds: parseFloat(elapsed),
     };
 
-    // 7. 🔥 DB에 저장 (NEW!)
+    // 8. DB에 저장
     console.log('[AI 검토] DB 저장 시작...');
 
     const { data: savedReview, error: reviewError } = await supabase
@@ -104,11 +135,9 @@ export async function POST(request) {
 
     if (reviewError) {
       console.error('[AI 검토] reviews 저장 실패:', reviewError);
-      // DB 저장 실패해도 결과는 반환 (UX 우선)
     } else {
       console.log('[AI 검토] reviews 저장 성공:', savedReview.id);
 
-      // 이슈 저장
       const issues = parsedResult.issues || [];
       if (issues.length > 0) {
         const issuesToInsert = issues.map((issue, idx) => ({
@@ -133,19 +162,25 @@ export async function POST(request) {
         }
       }
 
-      // 프로젝트 status를 'completed'로 업데이트
       await supabase
         .from('projects')
         .update({ status: 'completed', updated_at: new Date().toISOString() })
         .eq('id', projectId);
     }
 
-    // 8. 성공 응답
+    // 9. 🔥 사용량 정보도 같이 반환!
+    const newUsageCount = (monthlyUsed || 0) + 1;
+
     return NextResponse.json({
       success: true,
       result: parsedResult,
       usage,
       reviewId: savedReview?.id,
+      monthlyUsage: {
+        used: newUsageCount,
+        limit: MONTHLY_REVIEW_LIMIT,
+        remaining: MONTHLY_REVIEW_LIMIT - newUsageCount,
+      },
     });
 
   } catch (error) {
@@ -161,6 +196,66 @@ export async function POST(request) {
       error: error.message || '서버 오류'
     }, { status: 500 });
   }
+}
+
+/**
+ * GET /api/review
+ * 현재 사용량 조회
+ */
+export async function GET(request) {
+  try {
+    const supabase = await createClient();
+    const { data: { user } } = await supabase.auth.getUser();
+
+    if (!user) {
+      return NextResponse.json({ error: '로그인 필요' }, { status: 401 });
+    }
+
+    const usage = await checkMonthlyUsage(supabase, user.id);
+
+    return NextResponse.json({
+      used: usage.count,
+      limit: MONTHLY_REVIEW_LIMIT,
+      remaining: MONTHLY_REVIEW_LIMIT - usage.count,
+      exceeded: usage.exceeded,
+      nextResetDate: usage.nextResetDate,
+    });
+  } catch (error) {
+    return NextResponse.json({ error: error.message }, { status: 500 });
+  }
+}
+
+/**
+ * 🔥 월별 사용량 체크
+ */
+async function checkMonthlyUsage(supabase, userId) {
+  // 이번 달 시작일 (1일 00:00)
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const monthStartIso = monthStart.toISOString();
+
+  // 다음 달 시작일 (다음 달 1일 00:00)
+  const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+
+  // 이번 달 검토 수
+  const { count, error } = await supabase
+    .from('reviews')
+    .select('id', { count: 'exact', head: true })
+    .eq('user_id', userId)
+    .gte('created_at', monthStartIso);
+
+  if (error) {
+    console.error('[사용량 체크] 에러:', error);
+    return { count: 0, exceeded: false, nextResetDate: nextMonth.toISOString() };
+  }
+
+  const reviewCount = count || 0;
+
+  return {
+    count: reviewCount,
+    exceeded: reviewCount >= MONTHLY_REVIEW_LIMIT,
+    nextResetDate: nextMonth.toISOString(),
+  };
 }
 
 /**

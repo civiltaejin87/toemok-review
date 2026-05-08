@@ -245,6 +245,14 @@ export default function ProjectDetailPage() {
       const data = await response.json();
 
       if (!response.ok) {
+         // 🔥 사용량 한도 초과 (429)
+         if (response.status === 429 && data.limit) {
+          const nextReset = new Date(data.nextResetDate);
+          const daysLeft = Math.ceil((nextReset - new Date()) / (1000 * 60 * 60 * 24));
+          throw new Error(
+            `이번 달 검토 한도(${data.limit}회)를 모두 사용했습니다. ${daysLeft}일 후에 다시 사용 가능합니다.`
+          );
+        }
         throw new Error(data.error || 'AI 검토 실패');
       }
 

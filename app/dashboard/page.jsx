@@ -3,6 +3,8 @@ import { redirect } from 'next/navigation';
 import Link from 'next/link';
 import LogoutButton from './logout-button';
 
+const MONTHLY_REVIEW_LIMIT = 5;
+
 const STATUS_BADGES = {
   pending: { label: '대기', className: 'bg-gray-100 text-gray-700' },
   analyzing: { label: '분석 중', className: 'bg-blue-100 text-blue-700' },
@@ -50,10 +52,10 @@ export default async function DashboardPage() {
     .select('id', { count: 'exact', head: true })
     .eq('user_id', user.id);
 
-  // 🔥 진짜 이슈 수 계산!
+  // 진짜 이슈 수 계산
   const { data: reviewsData } = await supabase
     .from('reviews')
-    .select('total_issues, severity_critical, severity_warning, severity_info')
+    .select('total_issues, severity_critical, severity_warning, severity_info, created_at')
     .eq('user_id', user.id);
 
   const reviewsList = reviewsData || [];
@@ -61,7 +63,19 @@ export default async function DashboardPage() {
   const totalCritical = reviewsList.reduce((sum, r) => sum + (r.severity_critical || 0), 0);
   const totalWarning = reviewsList.reduce((sum, r) => sum + (r.severity_warning || 0), 0);
 
-  // 각 프로젝트의 파일 수 + 검토 상태 가져오기
+  // 🔥 이번 달 사용량 계산
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const monthlyReviews = reviewsList.filter(r => new Date(r.created_at) >= monthStart);
+  const monthlyUsed = monthlyReviews.length;
+  const monthlyRemaining = Math.max(0, MONTHLY_REVIEW_LIMIT - monthlyUsed);
+  const usagePercent = (monthlyUsed / MONTHLY_REVIEW_LIMIT) * 100;
+
+  // 다음 리셋 날짜
+  const nextReset = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+  const daysUntilReset = Math.ceil((nextReset - now) / (1000 * 60 * 60 * 24));
+
+  // 각 프로젝트의 파일 수 + 검토 상태
   const projectsWithCount = await Promise.all(
     projectsList.map(async (project) => {
       const { count } = await supabase
@@ -69,14 +83,13 @@ export default async function DashboardPage() {
         .select('id', { count: 'exact', head: true })
         .eq('project_id', project.id);
 
-      // 최신 검토 결과
       const { data: latestReview } = await supabase
         .from('reviews')
         .select('id, total_issues, severity_critical, severity_warning, created_at')
         .eq('project_id', project.id)
         .order('created_at', { ascending: false })
         .limit(1)
-        .single();
+        .maybeSingle();
 
       return {
         ...project,
@@ -108,6 +121,58 @@ export default async function DashboardPage() {
               {[profile.company, profile.role, profile.position].filter(Boolean).join(' · ')}
             </p>
           )}
+        </div>
+
+        {/* 🔥 사용량 카드 (NEW!) */}
+        <div className={`rounded-lg shadow-sm border p-5 mb-4 ${
+          monthlyRemaining === 0 ? 'bg-red-50 border-red-300' :
+          monthlyRemaining <= 1 ? 'bg-yellow-50 border-yellow-300' :
+          'bg-blue-50 border-blue-200'
+        }`}>
+          <div className="flex items-start justify-between gap-4 mb-3">
+            <div className="flex-1">
+              <div className="flex items-center gap-2 mb-1">
+                <span className="text-lg">{monthlyRemaining === 0 ? '🚫' : '🤖'}</span>
+                <h3 className={`text-base font-semibold ${
+                  monthlyRemaining === 0 ? 'text-red-900' :
+                  monthlyRemaining <= 1 ? 'text-yellow-900' :
+                  'text-blue-900'
+                }`}>
+                  이번 달 AI 검토 사용량
+                </h3>
+              </div>
+              <p className={`text-sm ${
+                monthlyRemaining === 0 ? 'text-red-700' :
+                monthlyRemaining <= 1 ? 'text-yellow-700' :
+                'text-blue-700'
+              }`}>
+                {monthlyRemaining === 0
+                  ? `이번 달 한도(${MONTHLY_REVIEW_LIMIT}회)를 모두 사용했습니다. ${daysUntilReset}일 후 리셋됩니다.`
+                  : `이번 달 ${monthlyUsed}회 사용 중 (${monthlyRemaining}회 남음). ${daysUntilReset}일 후 리셋됩니다.`}
+              </p>
+            </div>
+            <div className="text-right flex-shrink-0">
+              <p className={`text-3xl font-bold ${
+                monthlyRemaining === 0 ? 'text-red-600' :
+                monthlyRemaining <= 1 ? 'text-yellow-600' :
+                'text-blue-600'
+              }`}>
+                {monthlyUsed}<span className="text-lg text-gray-400">/{MONTHLY_REVIEW_LIMIT}</span>
+              </p>
+            </div>
+          </div>
+
+          {/* 진행률 바 */}
+          <div className="w-full bg-white rounded-full h-2 overflow-hidden">
+            <div
+              className={`h-full transition-all duration-300 ${
+                monthlyRemaining === 0 ? 'bg-red-500' :
+                monthlyRemaining <= 1 ? 'bg-yellow-500' :
+                'bg-blue-500'
+              }`}
+              style={{ width: `${Math.min(100, usagePercent)}%` }}
+            ></div>
+          </div>
         </div>
 
         {/* 통계 카드 (3개) */}
@@ -233,6 +298,10 @@ export default async function DashboardPage() {
           <h3 className="font-semibold text-purple-900 mb-1">🤖 AI 검토 활성화</h3>
           <p className="text-sm text-purple-700">
             Claude AI가 토목 내역서를 분석하여 단가 적정성, 노무비, 자재비, 품셈 정합성을 검토합니다.
+            <br />
+            <span className="text-xs text-purple-600 mt-1 inline-block">
+              💡 각 사용자는 매월 {MONTHLY_REVIEW_LIMIT}회 무료로 AI 검토를 이용할 수 있습니다.
+            </span>
           </p>
         </div>
       </div>
