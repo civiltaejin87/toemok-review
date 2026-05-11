@@ -247,8 +247,44 @@ ${jipgyeText}
       }, { status: 500 });
     }
 
+    // 6. 🔥 검증 결과 DB 저장 (Phase 5-3)
+    const summary = parsed.summary || {};
+    const results = parsed.results || [];
+
+    let validationId = null;
+    try {
+      const { data: validation, error: insertError } = await supabase
+        .from('validations')
+        .insert({
+          project_id: projectId,
+          user_id: user.id,
+          total_items: summary.total || results.length || 0,
+          matched_ok: summary.matched_ok || 0,
+          matched_diff: summary.matched_diff || 0,
+          unmatched: summary.unmatched || 0,
+          results: results,
+          elapsed_seconds: parseFloat(elapsedSeconds),
+          input_tokens: aiResponse.usage?.input_tokens || null,
+          output_tokens: aiResponse.usage?.output_tokens || null,
+        })
+        .select('id')
+        .single();
+
+      if (insertError) {
+        console.error('[검증결과 DB 저장 실패]', insertError);
+        // 저장 실패해도 클라이언트엔 결과는 반환 (UX 우선)
+      } else {
+        validationId = validation?.id || null;
+        console.log('[검증결과 DB 저장 성공]', validationId);
+      }
+    } catch (dbError) {
+      console.error('[검증결과 DB 저장 예외]', dbError);
+      // 저장 실패해도 결과는 반환
+    }
+
     return NextResponse.json({
       success: true,
+      validationId,
       result: parsed,
       usage: {
         elapsedSeconds,
